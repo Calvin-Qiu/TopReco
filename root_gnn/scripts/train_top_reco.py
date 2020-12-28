@@ -171,7 +171,7 @@ def train_and_evaluate(args):
 
 
     learning_rate = args.learning_rate
-    optimizer = snt.optimizers.SGD(learning_rate)
+    optimizer = snt.optimizers.Adam(learning_rate)
     model = getattr(all_models, 'FourTopPredictor')()
 
     checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
