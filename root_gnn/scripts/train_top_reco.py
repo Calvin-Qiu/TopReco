@@ -206,22 +206,35 @@ def train_and_evaluate(args):
         #         tf.math.sigmoid(output_op.globals[:, topreco.n_max_tops*5:]))
         #     for output_op in output_ops
         # ]
-        # alpha = tf.constant(1, dtype=tf.float32)
-        # loss_ops = [alpha * tf.compat.v1.losses.mean_squared_error(target_op.globals[:, :topreco.n_max_tops*4], output_op.globals[:, :topreco.n_max_tops*4])
-        #     + tf.compat.v1.losses.log_loss(
-        #         tf.cast(target_op.globals[:, topreco.n_max_tops*4:], tf.int32),\
-        #         tf.math.sigmoid(output_op.globals[:, topreco.n_max_tops*4:]))
-        #     for output_op in output_ops
-        # ]
+        
+        # alpha / 4 * |dP|^2 = |dP|^2 / (2 * sigma^2)
+        # ==> alpha  = 2 / sigma^2 = 200 if sigma = 0.1
+        alpha = tf.constant(200, dtype=tf.float32)
+        mask = target_op.globals[:, topreco.n_max_tops*(topreco.n_target_node_features - 1):] # indicator for real top
+        n_target_top = tf.reduce_sum(mask, 1)
+        
+        tops_preds = output_ops
 
-        # loss_ops = [ tf.nn.l2_loss((target_op.globals[:, :topreco.n_max_tops*4] - output_op.globals[:, :topreco.n_max_tops*4]))
+        loss_ops = []
+        for i in range(topreco.n_max_tops):
+            top_preds = tops_preds[i]
+            top_pred = top_preds[-1] # last prediction
+            logit_pred = top_pred.globals[:, -1]
+            four_vec_pred = top_pred.globals[:, :4]
+            four_vec_true = target_op.globals[:, i * 4 : (i + 1) * 4]
+            loss_mse = tf.compat.v1.losses.mean_squared_error(four_vec_true, four_vec_pred) \
+                - tf.compat.v1.log(tf.math.sigmoid(logit_pred))
+            loss_ops.append(alpha * loss_mse * tf.cast((i < n_target_top), dtype=tf.float32))
+            # end of sequence loss
+            loss_eos = - tf.compat.v1.log(1 - tf.math.sigmoid(logit_pred))
+            loss_ops.append(loss_eos * tf.cast((i == n_target_top), dtype=tf.float32))
+        
+        # L1 4-vector regression loss
+        # loss_ops = [ tf.compat.v1.losses.absolute_difference(
+        #                     target_op.globals[:, :topreco.n_max_tops*4],\
+        #                     output_op.globals[:, :topreco.n_max_tops*4])
         #     for output_op in output_ops
         # ]
-        loss_ops = [ tf.compat.v1.losses.absolute_difference(
-                            target_op.globals[:, :topreco.n_max_tops*4],\
-                            output_op.globals[:, :topreco.n_max_tops*4])
-            for output_op in output_ops
-        ]
 
         # loss_ops = [tf.compat.v1.losses.mean_squared_error(target_op.globals[:, :topreco.n_max_tops*4], output_op.globals[:, :topreco.n_max_tops*4])
         #     for output_op in output_ops
