@@ -209,25 +209,28 @@ def train_and_evaluate(args):
         
         # alpha / 4 * |dP|^2 = |dP|^2 / (2 * sigma^2)
         # ==> alpha  = 2 / sigma^2 = 200 if sigma = 0.1
-        alpha = tf.constant(200, dtype=tf.float32)
         mask = target_op.globals[:, topreco.n_max_tops*(topreco.n_target_node_features - 1):] # indicator for real top
         n_target_top = tf.reduce_sum(mask, 1)
-        
+        alpha = tf.constant(1, dtype=tf.float32)
+        batch_size = target_op.globals.shape[0]
+        tops_true = tf.reshape(target_op.globals, [batch_size, topreco.n_target_node_features, topreco.n_max_tops])
+        tops_true = tf.einsum('ijk->ikj', tops_true)
+
         tops_preds = output_ops
 
         loss_ops = []
+        eps = 1e-5
         for i in range(topreco.n_max_tops):
             top_preds = tops_preds[i]
-            top_pred = top_preds[-1] # last prediction
-            logit_pred = top_pred.globals[:, -1]
-            four_vec_pred = top_pred.globals[:, :4]
-            four_vec_true = target_op.globals[:, i * 4 : (i + 1) * 4]
-            loss_mse = tf.compat.v1.losses.mean_squared_error(four_vec_true, four_vec_pred) \
-                - tf.compat.v1.log(tf.math.sigmoid(logit_pred))
-            loss_ops.append(alpha * loss_mse * tf.cast((i < n_target_top), dtype=tf.float32))
-            # end of sequence loss
-            loss_eos = - tf.compat.v1.log(1 - tf.math.sigmoid(logit_pred))
-            loss_ops.append(loss_eos * tf.cast((i == n_target_top), dtype=tf.float32))
+            for top_pred in top_preds:
+                # four_vec_pred = top_pred.globals[:, :4]
+                # four_vec_true = tops_true[:, i, :4]
+                loss = tf.compat.v1.losses.absolute_difference(tops_true[:, i, :4], top_pred.globals[:, :4]) \
+                    # - tf.compat.v1.log(eps + tf.math.sigmoid(top_pred.globals[:, -1]))
+                loss_ops.append(alpha * loss * tf.cast((i < n_target_top), dtype=tf.float32))
+                # end of sequence loss
+                # loss_eos = - tf.compat.v1.log(eps + 1 - tf.math.sigmoid(top_pred.globals[:, -1]))
+                # loss_ops.append(loss_eos * tf.cast((i == n_target_top), dtype=tf.float32))
         
         # L1 4-vector regression loss
         # loss_ops = [ tf.compat.v1.losses.absolute_difference(

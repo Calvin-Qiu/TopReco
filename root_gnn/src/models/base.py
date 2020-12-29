@@ -29,7 +29,7 @@ def make_mlp_model():
   # swish, relu, relu6, leaky_relu
   return snt.Sequential([
       snt.nets.MLP([128, 64]*NUM_LAYERS,
-                    activation=tf.nn.relu,
+                    activation=tf.nn.leaky_relu,
                     activate_final=True, 
                   #  dropout_rate=DROPOUT_RATE
         ),

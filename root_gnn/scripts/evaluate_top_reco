@@ -58,7 +58,6 @@ if __name__ == "__main__":
     for event in dataset:
         if args.nevts > 0 and ievt >= args.nevts:
             break
-
         ievt += 1
         inputs_tr, targets_tr = event
         in_list.append(inputs_tr)
@@ -66,18 +65,16 @@ if __name__ == "__main__":
         if len(in_list) == global_batch_size:
             inputs_tr = utils_tf.concat(in_list, axis=0)
             targets_tr = utils_tf.concat(target_list, axis=0)
-            output_ops = model(inputs_tr, num_processing_steps, is_training=False)
-            output = output_ops[-1]
-            predicts.append(output.globals)
+            output = model.test_predict(inputs_tr, num_processing_steps)
+            predicts.append(output)
             truths.append(targets_tr.globals)
             in_list = []
             target_list = []
     if len(in_list) > 0:
         inputs_tr = utils_tf.concat(in_list, axis=0)
         targets_tr = utils_tf.concat(target_list, axis=0)
-        output_ops = model(inputs_tr, num_processing_steps, is_training=False)
-        output = output_ops[-1]
-        predicts.append(output.globals)
+        output = model.test_predict(inputs_tr, num_processing_steps)
+        predicts.append(output)
         truths.append(targets_tr.globals)
 
 

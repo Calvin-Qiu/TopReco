@@ -1,3 +1,4 @@
+import numpy as np
 import tensorflow as tf
 import sonnet as snt
 
@@ -105,6 +106,17 @@ class FourTopPredictor(snt.Module):
             tops_pred.append(top)
         return tops_pred
 
+    def test_predict(self, inputs_tr, num_processing_steps):
+        tops_pred = self.__call__(inputs_tr, num_processing_steps, is_training=False)
+        batch_size = inputs_tr.globals.shape[0]
+        output = np.zeros([batch_size, n_max_tops, n_target_node_features])
+        for i in range(n_max_tops):
+            output[:, i, :4] = tops_pred[i][-1].globals[:, :4]
+            output[:, i, 4] = np.zeros_like(output[:, i, 4]) # charge not being predicted
+            output[:, i, -1] = tf.math.sigmoid(tops_pred[i][-1].globals[:, -1])
+        output = np.einsum('ijk->ikj', output)
+        output = output.reshape([batch_size, -1]) # flatten to match target arrangment
+        return output
 
     def predict_next(self, encoded_input, last_state, num_processing_steps, is_training=True):
         state = self._input_state(utils_tf.concat([encoded_input, last_state], axis=1))
