@@ -32,8 +32,8 @@ from root_gnn.src.datasets import graph
 from root_gnn.utils import load_yaml
 
 
-target_scales = np.array([145.34593924, 145.57711889, 432.92148524, 281.44161905, 1, 1]*topreco.n_max_tops).T.reshape((-1,))
-target_mean = np.array([6.74674671e-02, -6.17142186e-02,  4.18239305e-01, 4.24881531e+02, 0, 0]*topreco.n_max_tops).T.reshape((-1,))
+target_scales = np.array([65, 65, 570, 400, 1, 1]*topreco.n_max_tops).reshape((topreco.n_max_tops, -1)).T.reshape((-1,))
+target_mean = np.array([0, 0, 0, 400, 0, 0]*topreco.n_max_tops).reshape((topreco.n_max_tops, -1)).T.reshape((-1,))
 
 
 def init_workers(distributed=False):
@@ -180,8 +180,6 @@ def train_and_evaluate(args):
     logging.info("Loading latest checkpoint from: {}".format(output_dir))
     _ = checkpoint.restore(ckpt_manager.latest_checkpoint)
 
-    target_scales = np.array([145.34593924, 145.57711889, 432.92148524, 281.44161905, 1, 1]*topreco.n_max_tops).reshape((topreco.n_max_tops, -1)).T.reshape((-1,))
-    target_mean = np.array([6.74674671e-02, -6.17142186e-02,  4.18239305e-01, 4.24881531e+02, 0, 0]*topreco.n_max_tops).reshape((topreco.n_max_tops, -1)).T.reshape((-1,))
     # training loss
     def loss_fcn(target_op, output_ops):
         # print("target size: ", target_op.nodes.shape)
@@ -207,8 +205,10 @@ def train_and_evaluate(args):
         #     for output_op in output_ops
         # ]
         
+        ###### RGN loss #####
         # alpha / 4 * |dP|^2 = |dP|^2 / (2 * sigma^2)
         # ==> alpha  = 2 / sigma^2 = 200 if sigma = 0.1
+        
         mask = target_op.globals[:, topreco.n_max_tops*(topreco.n_target_node_features - 1):] # indicator for real top
         n_target_top = tf.reduce_sum(mask, 1)
         alpha = tf.constant(1, dtype=tf.float32)
@@ -223,27 +223,28 @@ def train_and_evaluate(args):
         for i in range(topreco.n_max_tops):
             top_preds = tops_preds[i]
             for top_pred in top_preds:
-                # four_vec_pred = top_pred.globals[:, :4]
-                # four_vec_true = tops_true[:, i, :4]
-                loss = tf.compat.v1.losses.absolute_difference(tops_true[:, i, :4], top_pred.globals[:, :4]) \
-                    # - tf.compat.v1.log(eps + tf.math.sigmoid(top_pred.globals[:, -1]))
-                loss_ops.append(alpha * loss * tf.cast((i < n_target_top), dtype=tf.float32))
+                four_vec_pred = top_pred.globals[:, :4]
+                four_vec_true = tops_true[:, i, :4]
+                diff = four_vec_true - four_vec_pred
+                target_exist = tf.cast((i < n_target_top), dtype=tf.float32)
+                diff = tf.einsum('ij,i->ij', diff, target_exist)
+                # loss = tf.math.reduce_mean(tf.math.abs(diff)) \
+                # - tf.compat.v1.log(eps + tf.math.sigmoid(top_pred.globals[:, -1]))
+                loss = tf.compat.v1.losses.mean_squared_error(diff, tf.zeros_like(diff))
+                loss_ops.append(alpha * loss)
                 # end of sequence loss
                 # loss_eos = - tf.compat.v1.log(eps + 1 - tf.math.sigmoid(top_pred.globals[:, -1]))
-                # loss_ops.append(loss_eos * tf.cast((i == n_target_top), dtype=tf.float32))
+                # loss_ops.append(loss_eos * tf.cast((i == n_target_top), dtype=tf.float32)) # FIX ME: this is an outer-product
         
-        # L1 4-vector regression loss
+        ###### L1 4-vector regression loss #####
         # loss_ops = [ tf.compat.v1.losses.absolute_difference(
-        #                     target_op.globals[:, :topreco.n_max_tops*4],\
-        #                     output_op.globals[:, :topreco.n_max_tops*4])
-        #     for output_op in output_ops
+        #                     target_op.globals[:, :4],\
+        #                     output_op.globals[:, :4])
+        #     for output_op in output_ops[0] # taking first top only
         # ]
 
-        # loss_ops = [tf.compat.v1.losses.mean_squared_error(target_op.globals[:, :topreco.n_max_tops*4], output_op.globals[:, :topreco.n_max_tops*4])
-        #     for output_op in output_ops
-        # ]
-
-        return tf.stack(loss_ops)
+        total_loss = tf.stack(loss_ops)
+        return tf.math.reduce_sum(total_loss) / tf.constant(num_processing_steps_tr, dtype=tf.float32) / topreco.n_max_tops
 
     @functools.partial(tf.function, input_signature=input_signature)
     def train_step(inputs_tr, targets_tr, first_batch):
@@ -254,8 +255,7 @@ def train_and_evaluate(args):
         print(inputs_tr.nodes)
         with tf.GradientTape() as tape:
             outputs_tr = model(inputs_tr, num_processing_steps_tr, is_training=True)
-            loss_ops_tr = loss_fcn(targets_tr, outputs_tr)
-            loss_op_tr = tf.math.reduce_sum(loss_ops_tr) / tf.constant(num_processing_steps_tr, dtype=tf.float32)
+            loss_op_tr = loss_fcn(targets_tr, outputs_tr)
 
         # Horovod: add Horovod Distributed GradientTape.
         if args.distributed:
@@ -292,6 +292,7 @@ def train_and_evaluate(args):
 
     out_str  = "Start training " + time.strftime('%d %b %Y %H:%M:%S', time.localtime())
     out_str += '\n'
+    out_str += f"lr = {learning_rate}\n"
     out_str += "Epoch, Time [mins], Loss\n"
     log_name = os.path.join(output_dir, "training_log.txt")
     if dist.rank == 0:

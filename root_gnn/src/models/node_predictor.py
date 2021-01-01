@@ -75,7 +75,7 @@ class FourTopPredictor(snt.Module):
             use_globals=False,
         )
 
-        self._core = MLPGraphNetwork()
+        self._cores = [MLPGraphNetwork() for _ in range(8)]
 
         self._input_state = MLPGraphNetwork()
 
@@ -122,8 +122,8 @@ class FourTopPredictor(snt.Module):
         state = self._input_state(utils_tf.concat([encoded_input, last_state], axis=1))
 
         output_ops = []
-        for _ in range(num_processing_steps):
-            state = self._core(state)
+        for i in range(num_processing_steps):
+            state = (self._cores[i])(state)
             output = state.replace(globals=self._global_nn(state.globals, is_training))
             output_ops.append(output)
 
