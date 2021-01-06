@@ -23,7 +23,6 @@ from types import SimpleNamespace
 import tensorflow as tf
 from tensorflow.compat.v1 import logging
 logging.info("TF Version:{}".format(tf.__version__))
-import horovod.tensorflow as hvd
 
 
 from root_gnn import model as all_models
@@ -34,22 +33,6 @@ from root_gnn.utils import load_yaml
 
 target_scales = np.array([65, 65, 570, 400, 1, 1]*topreco.n_max_tops).reshape((topreco.n_max_tops, -1)).T.reshape((-1,))
 target_mean = np.array([0, 0, 0, 400, 0, 0]*topreco.n_max_tops).reshape((topreco.n_max_tops, -1)).T.reshape((-1,))
-
-
-def init_workers(distributed=False):
-    if distributed:
-        hvd.init()
-        assert hvd.mpi_threads_supported()
-        from mpi4py import MPI
-        assert hvd.size() == MPI.COMM_WORLD.Get_size()
-        comm = MPI.COMM_WORLD
-        print("Rank: {}, Size: {}".format(hvd.rank(), hvd.size()))
-        return SimpleNamespace(rank=hvd.rank(), size=hvd.size(),
-                                local_rank=hvd.local_rank(),
-                                local_size=hvd.local_size(), comm=comm)
-    else:
-        print("not doing distributed")
-        return SimpleNamespace(rank=0, size=1, local_rank=0, local_size=1, comm=None)
 
 def read_dataset(filenames):
     """
@@ -116,69 +99,60 @@ def loop_dataset(datasets, batch_size):
             yield dataset
 
 def train_and_evaluate(args):
-    dist = init_workers(args.distributed)
-
     device = 'CPU'
     gpus = tf.config.experimental.list_physical_devices("GPU")
-    logging.info("found {} GPUs".format(len(gpus)))
+    n_gpus = len(gpus)
+    logging.info("Found {} GPUs".format(n_gpus))
+    distributed = args.distributed
 
     for gpu in gpus:
         tf.config.experimental.set_memory_growth(gpu, True)
 
     if len(gpus) > 0:
-        device = "{}GPUs".format(len(gpus))
-    if gpus and args.distributed:
-        tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
+        device = "{} GPUs".format(len(gpus))
 
     output_dir = args.output_dir
-    if dist.rank == 0:
-        os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     logging.info("Checkpoints and models saved at {}".format(output_dir))
 
     num_processing_steps_tr = args.num_iters     ## level of message-passing
     n_epochs = args.max_epochs
     logging.info("{} epochs with batch size {}".format(n_epochs, args.batch_size))
     logging.info("{} processing steps in the model".format(num_processing_steps_tr))
-    logging.info("I am in hvd rank: {} of  total {} ranks".format(dist.rank, dist.size))
 
-    if dist.rank == 0:
-        train_input_dir = os.path.join(args.input_dir, 'train') 
-        val_input_dir = os.path.join(args.input_dir, 'val')
-        train_files = tf.io.gfile.glob(os.path.join(train_input_dir, args.patterns))
-        eval_files = tf.io.gfile.glob(os.path.join(val_input_dir, args.patterns))
-        ## split the number of files evenly to all ranks
-        train_files = [x.tolist() for x in np.array_split(train_files, dist.size)]
-        eval_files = [x.tolist() for x in np.array_split(eval_files, dist.size)]
-    else:
-        train_files = None
-        eval_files = None
+    train_input_dir = os.path.join(args.input_dir, 'train') 
+    val_input_dir = os.path.join(args.input_dir, 'val')
+    train_files = tf.io.gfile.glob(os.path.join(train_input_dir, args.patterns))
+    eval_files = tf.io.gfile.glob(os.path.join(val_input_dir, args.patterns))
 
-    if args.distributed:
-        train_files = dist.comm.scatter(train_files, root=0)
-        eval_files = dist.comm.scatter(eval_files, root=0)
-    else:
-        train_files = train_files[0]
-        eval_files = eval_files[0]
-
-    logging.info("rank {} has {} training files and {} evaluation files".format(
-        dist.rank, len(train_files), len(eval_files)))
+    if distributed:
+        logging.info("Doing distributed training on {} GPUS".format(n_gpus))
+        strategy = tf.distribute.MirroredStrategy()
 
     AUTO = tf.data.experimental.AUTOTUNE
     training_dataset, ngraphs_train = read_dataset(train_files)
     training_dataset = training_dataset.prefetch(AUTO)
-
     input_signature = get_input_signature(training_dataset, args.batch_size)
-
-
     learning_rate = args.learning_rate
-    optimizer = snt.optimizers.Adam(learning_rate)
-    model = getattr(all_models, 'FourTopPredictor')()
 
-    checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-    ckpt_manager = tf.train.CheckpointManager(checkpoint, directory=output_dir,
-                                max_to_keep=5, keep_checkpoint_every_n_hours=8)
-    logging.info("Loading latest checkpoint from: {}".format(output_dir))
-    _ = checkpoint.restore(ckpt_manager.latest_checkpoint)
+    if distributed:
+        with strategy.scope():
+            optimizer = tf.keras.optimizers.Adam(learning_rate)
+            model = getattr(all_models, 'FourTopPredictor')()
+            checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+            ckpt_manager = tf.train.CheckpointManager(checkpoint, directory=output_dir,
+                                        max_to_keep=5, keep_checkpoint_every_n_hours=8)
+            logging.info("Loading latest checkpoint from: {}".format(output_dir))
+            _ = checkpoint.restore(ckpt_manager.latest_checkpoint)
+    else:
+        learning_rate = args.learning_rate
+        optimizer = tf.keras.optimizers.Adam(learning_rate)
+        model = getattr(all_models, 'FourTopPredictor')()
+        checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+        ckpt_manager = tf.train.CheckpointManager(checkpoint, directory=output_dir,
+                                    max_to_keep=5, keep_checkpoint_every_n_hours=8)
+        logging.info("Loading latest checkpoint from: {}".format(output_dir))
+        _ = checkpoint.restore(ckpt_manager.latest_checkpoint)
 
     # training loss
     def loss_fcn(target_op, output_ops):
@@ -230,7 +204,7 @@ def train_and_evaluate(args):
                 diff = tf.einsum('ij,i->ij', diff, target_exist)
                 # loss = tf.math.reduce_mean(tf.math.abs(diff)) \
                 # - tf.compat.v1.log(eps + tf.math.sigmoid(top_pred.globals[:, -1]))
-                loss = tf.compat.v1.losses.absolute_difference(diff, tf.zeros_like(diff))
+                loss = tf.compat.v1.losses.mean_squared_error(diff, tf.zeros_like(diff))
                 loss_ops.append(alpha * loss)
                 # end of sequence loss
                 # loss_eos = - tf.compat.v1.log(eps + 1 - tf.math.sigmoid(top_pred.globals[:, -1]))
@@ -246,46 +220,56 @@ def train_and_evaluate(args):
         total_loss = tf.stack(loss_ops)
         return tf.math.reduce_sum(total_loss) / tf.constant(num_processing_steps_tr, dtype=tf.float32) / topreco.n_max_tops
 
-    @functools.partial(tf.function, input_signature=input_signature)
-    def train_step(inputs_tr, targets_tr, first_batch):
-        print("Tracing update_step")
-        print("inputs nodes", inputs_tr.nodes.shape)
-        print("inputs edges", inputs_tr.edges.shape)
-        print("input n_node", inputs_tr.n_node.shape)
-        print(inputs_tr.nodes)
+    # @functools.partial(tf.function, input_signature=input_signature)
+    def train_step(data):
+        inputs_tr, targets_tr = data
         with tf.GradientTape() as tape:
             outputs_tr = model(inputs_tr, num_processing_steps_tr, is_training=True)
             loss_op_tr = loss_fcn(targets_tr, outputs_tr)
-
-        # Horovod: add Horovod Distributed GradientTape.
-        if args.distributed:
-            tape = hvd.DistributedGradientTape(tape)
+            if distributed:
+                loss_op_tr /= strategy.num_replicas_in_sync # so that we don't multiply loss by number of workers after reducing
 
         gradients = tape.gradient(loss_op_tr, model.trainable_variables)
-        optimizer.apply(gradients, model.trainable_variables)
-
-        # Horovod: broadcast initial variable states from rank 0 to all other processes.
-        # This is necessary to ensure consistent initialization of all workers when
-        # training is started with random weights or restored from a checkpoint.
-        #
-        # Note: broadcast should be done after the first gradient step to ensure optimizer
-        # initialization.
-        if args.distributed and first_batch:
-            hvd.broadcast_variables(model.trainable_variables, root_rank=0)
-            hvd.broadcast_variables(optimizer.variables, root_rank=0)
+        # optimizer.apply(gradients, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
 
         return loss_op_tr
+
+    @functools.partial(tf.function, input_signature=input_signature)
+    def distributed_train_step(distributed_data):
+      per_replica_losses = strategy.run(train_step, args=(distributed_data))
+      return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
 
 
     def train_epoch(dataset):
         total_loss = 0.
         batch = 0
-        for inputs in tqdm(loop_dataset(dataset, args.batch_size)):
-            input_tr, targets_tr = inputs
-            new_target = (targets_tr.globals - target_mean) / target_scales
-            targets_tr = targets_tr.replace(globals=new_target)
-            total_loss += train_step(input_tr, targets_tr, batch==0).numpy()
+
+        # for inputs in tqdm(loop_dataset(dataset, args.batch_size)):
+        #     inputs_tr, targets_tr = inputs
+        #     new_target = (targets_tr.globals - target_mean) / target_scales
+        #     targets_tr = targets_tr.replace(globals=new_target)
+        #     if distributed:
+        #         def dist_data_fn(ctx):
+        #             num_replicas = ctx.num_replicas_in_sync
+        #             replica_id = tf.distribute.get_replica_context().replica_id_in_sync_group
+        #             # batch_size_per_replica = args.batch_size // num_replicas # if there is non-zero remainder, leftover data will be ignored
+        #             replica_batch_size = ctx.get_per_replica_batch_size(args.batch_size)
+        #             dist_inputs = utils_tf.get_graph(inputs_tr, slice(replica_batch_size * replica_id, replica_batch_size * (replica_id + 1)))
+        #             dist_targets = utils_tf.get_graph(targets_tr, slice(replica_batch_size * replica_id, replica_batch_size * (replica_id + 1)))
+        #             return (dist_inputs, dist_targets)
+        #         distributed_data = strategy.experimental_distribute_datasets_from_function(dist_data_fn)
+        #         total_loss += distributed_train_step(distributed_data).numpy()
+        #     else:
+        #         total_loss += train_step((inputs_tr, targets_tr)).numpy()
+        #     batch += 1
+
+        dataset = dataset.batch(batch_size=args.batch_size, drop_remainder=True)
+        dist_dataset = strategy.experimental_distribute_dataset(dataset)
+        for data in dist_dataset:
+            total_loss += distributed_train_step(dist_dataset).numpy()
             batch += 1
+
         logging.info("total batches: {}".format(batch))
         return total_loss/batch, batch
         # return total_loss/batch/args.batch_size, batch
@@ -295,9 +279,8 @@ def train_and_evaluate(args):
     out_str += f"lr = {learning_rate}\n"
     out_str += "Epoch, Time [mins], Loss\n"
     log_name = os.path.join(output_dir, "training_log.txt")
-    if dist.rank == 0:
-        with open(log_name, 'a') as f:
-            f.write(out_str)
+    with open(log_name, 'a') as f:
+        f.write(out_str)
     now = time.time()
 
     for epoch in range(n_epochs):
@@ -311,17 +294,14 @@ def train_and_evaluate(args):
         logging.info("{} epoch takes {:.2f} mins with loss {:.4f} in {} batches".format(
             epoch, (this_epoch-now)/60., loss, batches))
         out_str = "{}, {:.2f}, {:.4f}\n".format(epoch, (this_epoch-now)/60., loss)
-
         now = this_epoch
-        if dist.rank == 0:
-            with open(log_name, 'a') as f:
-                f.write(out_str)
-            ckpt_manager.save()
-
-    if dist.rank == 0:
-        out_log = "End @ " + time.strftime('%d %b %Y %H:%M:%S', time.localtime()) + "\n"
         with open(log_name, 'a') as f:
-            f.write(out_log)
+            f.write(out_str)
+        ckpt_manager.save()
+
+    out_log = "End @ " + time.strftime('%d %b %Y %H:%M:%S', time.localtime()) + "\n"
+    with open(log_name, 'a') as f:
+        f.write(out_log)
 
 
 if __name__ == "__main__":
